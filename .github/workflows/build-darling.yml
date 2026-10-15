@@ -42,6 +42,19 @@ jobs:
           git submodule foreach --quiet 'git submodule update --init --recursive --depth 1'
           git rev-parse HEAD > /tmp/darling-commit.txt
           git submodule status > /tmp/darling-submodules.txt
+      - uses: actions/checkout@v4
+        with:
+          path: buildrepo
+      - name: Apply demo patches
+        # NABI 上で動かすための最小限の修正。対象サブモジュールごとに patches/<submodule>/ に置く
+        run: |
+          for d in buildrepo/patches/*/; do
+            sub=$(basename "$d")
+            for p in "$d"*.patch; do
+              echo "applying $p to src/external/$sub"
+              git -C "/build/darling/src/external/$sub" apply --verbose "$GITHUB_WORKSPACE/$p"
+            done
+          done
       - name: Configure
         run: |
           cmake -S /build/darling -B /build/darling-build -G Ninja \

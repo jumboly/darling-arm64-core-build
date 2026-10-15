@@ -1,0 +1,20 @@
+--- a/src/thread.cpp
++++ b/src/thread.cpp
+@@ -115,6 +115,17 @@
+ {
+ 	_tid = -1;
+ 
++	// mac-hello-world-demo patch: with no PID namespace between the server and
++	// the client (DARLING_NONROOT starts processes without one), the namespaced
++	// TID already is the global TID. Checking that first also keeps thread
++	// registration working where procfs does not list other processes - NABI
++	// serves only /proc/self - instead of failing with ESRCH and dropping every
++	// call as "Received call from non-existent thread?".
++	if (process->id() == process->nsid()) {
++		_tid = _nstid;
++	}
++
++	if (_tid == -1)
+ 	for (const auto& entry: std::filesystem::directory_iterator("/proc/" + std::to_string(process->id()) + "/task")) {
+ 		std::ifstream statusFile(entry.path() / "status");
+ 		std::string line;
