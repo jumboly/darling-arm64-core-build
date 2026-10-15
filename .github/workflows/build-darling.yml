@@ -1,0 +1,82 @@
+# VibeDarling の core コンポーネントを arm64 Linux 上でビルドし、DESTDIR のインストールツリーを
+# 成果物として出す。NABI 上でのネイティブビルドは fork ごとのチェックポイントのため極端に遅く、
+# ビルド場所は実行経路（NABI → Darling → Mach-O）に影響しないので、ビルドだけをここで行う。
+# コンテナを debian:trixie にしているのは、実行先（NABI 上の Debian 13 rootfs）と glibc を揃えるため。
+name: build-darling-core
+
+on:
+  workflow_dispatch:
+    inputs:
+      darling_commit:
+        description: VibeDarling commit to build
+        default: f8d8c8163c132bec3dda4e76150eae56bbd44adf
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 340
+    container: debian:trixie
+    env:
+      DARLING_COMMIT: ${{ github.event.inputs.darling_commit || 'f8d8c8163c132bec3dda4e76150eae56bbd44adf' }}
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            clang lld llvm-dev cmake ninja-build bison flex pkg-config libelf-dev libbsd-dev \
+            libcap-dev libcap2-bin libfuse-dev libudev-dev libxml2-dev python3 git file \
+            ca-certificates make xz-utils zstd
+      - name: Fetch VibeDarling
+        run: |
+          git init -q /build/darling && cd /build/darling
+          git remote add origin https://github.com/VibeDarling/darling.git
+          git fetch -q --depth 1 origin "$DARLING_COMMIT" && git checkout -q FETCH_HEAD
+          # core に不要で巨大なサブモジュールは除外する。vim/ruby/JavaScriptCore/openjdk は
+          # CMake の add_subdirectory と SDK ヘッダ検証が参照するため取得する（手元の試行で判明）
+          git config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{print $2}' \
+            | grep -v -E '/python$|/perl$|python_modules|WebCore|/swift$' > /tmp/subs
+          xargs git submodule update --init --depth 1 --jobs 8 -- < /tmp/subs
+          git submodule foreach --quiet 'git submodule update --init --recursive --depth 1'
+          git rev-parse HEAD > /tmp/darling-commit.txt
+          git submodule status > /tmp/darling-submodules.txt
+      - name: Configure
+        run: |
+          cmake -S /build/darling -B /build/darling-build -G Ninja \
+            -DCOMPONENTS=core -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ 2>&1 | tee /tmp/configure.log
+          test "${PIPESTATUS[0]:-0}" = 0
+        shell: bash
+      - name: Build
+        shell: bash
+        run: |
+          cd /build/darling-build
+          set -o pipefail
+          ninja -j"$(nproc)" -k 0 2>&1 | tee /tmp/build.log | grep -E "FAILED|error:" | head -200 || true
+          # 初回はグラフ再生成で ninja が早期終了することがある（VibeDarling CLAUDE.md の注意）
+          ninja -j"$(nproc)" 2>&1 | tee -a /tmp/build.log | tail -30
+          test "$(ninja -n | tail -1)" = "ninja: no work to do."
+      - name: Install to DESTDIR
+        run: |
+          cd /build/darling-build
+          DESTDIR=/build/darling-root ninja install > /tmp/install.log 2>&1 || { tail -50 /tmp/install.log; exit 1; }
+          cp /tmp/darling-commit.txt /tmp/darling-submodules.txt /build/darling-root/
+          cd /build && tar -C darling-root -cf - . | zstd -T0 -19 > darling-root.tar.zst
+          sha256sum darling-root.tar.zst | tee darling-root.tar.zst.sha256
+      - name: Collect logs
+        if: always()
+        run: mkdir -p /build/logs && cp /tmp/*.log /tmp/darling-*.txt /build/logs/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darling-root-arm64
+          path: |
+            /build/darling-root.tar.zst
+            /build/darling-root.tar.zst.sha256
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: /build/logs
